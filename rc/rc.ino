@@ -1,27 +1,56 @@
 // ESP32  --  RC (transmitter)
-// Reads a joystick (X on VP/GPIO36, Y on VN/GPIO39) and sends the values to the
-// car over ESP-NOW using the broadcast address (no MAC to hardcode).
+// Dual analog joystick -> ESP-NOW -> car (mecanum, holonomic).
+//   Left stick : X = strafe (VP/GPIO36), Y = forward/back (VN/GPIO39)
+//   Right stick: X = rotation (GPIO34);  Y = spare (GPIO35)
+// Both sticks must be on ADC1 pins because ESP-NOW/WiFi disables ADC2.
 
 #include <esp_now.h>
 #include <WiFi.h>
 
-// ---- Joystick pins ---------------------------------------------------------
-const int JOY_X = 36;  // VP  (SENSOR_VP) - ADC1_CH0
-const int JOY_Y = 39;  // VN  (SENSOR_VN) - ADC1_CH3
+// ---- Joystick pins (all ADC1) ----------------------------------------------
+const int JOY1_X = 36;  // VP  - strafe
+const int JOY1_Y = 39;  // VN  - forward/back
+const int JOY2_X = 34;  //     - rotation
+const int JOY2_Y = 35;  //     - spare / reserved
 
-// Joystick center is measured at boot (this stick rests near ~1870, not 2048).
-// Keep the stick centered during power-up / reset.
-int centerX = 2048;
-int centerY = 2048;
+// Stick centers AND deadzones are measured at boot from the resting sticks.
+// Keep both sticks centered and still during power-up / reset.
+int center1X = 2048, center1Y = 2048;
+int center2X = 2048, center2Y = 2048;
+
+// Per-axis deadzone, computed from observed jitter (not hardcoded).
+int dz1X = 8, dz1Y = 8, dz2X = 8;
+
+const float DZ_FACTOR = 3.0;  // deadzone = observed jitter * this
+const int   DZ_MIN    = 6;    // floor: some zone even if a pot reads rock-steady
+const int   DZ_MAX    = 300;  // cap: guards against a stick moved during calibration
 
 // ---- Wireless packet (must match car side) ---------------------------------
 typedef struct {
-  int16_t x;  // steering, centered at 0  (roughly -2048 .. +2048)
-  int16_t y;  // throttle, centered at 0  (roughly -2048 .. +2048)
+  int16_t x;  // strafe   (left stick X, centered)
+  int16_t y;  // forward  (left stick Y, centered)
+  int16_t r;  // rotation (right stick X, centered)
 } JoystickPacket;
 
 // Broadcast to any ESP-NOW peer listening on this channel.
 uint8_t broadcastAddr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Deadzone from observed jitter: half the sampled spread, scaled and clamped.
+int calcDeadzone(int mn, int mx, int center) {
+  int jitter = max(mx - center, center - mn);
+  int dz = (int)(jitter * DZ_FACTOR);
+  if (dz < DZ_MIN) dz = DZ_MIN;
+  if (dz > DZ_MAX) dz = DZ_MAX;
+  return dz;
+}
+
+// Apply deadzone continuously: 0 inside the band, then ramps from 0 at the edge
+// (subtracts the band rather than a hard step, so there's no jump).
+int16_t applyDeadzone(int centered, int dz) {
+  if (centered >  dz) return centered - dz;
+  if (centered < -dz) return centered + dz;
+  return 0;
+}
 
 // Called after each send with the delivery result.
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
@@ -52,36 +81,51 @@ void setup() {
     Serial.println("add_peer FAILED");
   }
 
-  // Calibrate: average the resting stick to find true center.
-  long sumX = 0, sumY = 0;
-  const int N = 64;
+  // Calibrate: hold the sticks still. Sample the rest position to find each
+  // axis's center AND its jitter (min/max spread), then derive the deadzone.
+  Serial.println("Calibrating - keep sticks centered & still...");
+  const int N = 128;
+  long s1x = 0, s1y = 0, s2x = 0;
+  int mn1x = 4095, mx1x = 0, mn1y = 4095, mx1y = 0, mn2x = 4095, mx2x = 0;
   for (int i = 0; i < N; i++) {
-    sumX += analogRead(JOY_X);
-    sumY += analogRead(JOY_Y);
-    delay(5);
+    int a = analogRead(JOY1_X);
+    int b = analogRead(JOY1_Y);
+    int c = analogRead(JOY2_X);
+    s1x += a; s1y += b; s2x += c;
+    if (a < mn1x) mn1x = a;  if (a > mx1x) mx1x = a;
+    if (b < mn1y) mn1y = b;  if (b > mx1y) mx1y = b;
+    if (c < mn2x) mn2x = c;  if (c > mx2x) mx2x = c;
+    delay(4);
   }
-  centerX = sumX / N;
-  centerY = sumY / N;
-  Serial.print("center X="); Serial.print(centerX);
-  Serial.print(" Y=");       Serial.println(centerY);
+  center1X = s1x / N;  center1Y = s1y / N;  center2X = s2x / N;
+  dz1X = calcDeadzone(mn1x, mx1x, center1X);
+  dz1Y = calcDeadzone(mn1y, mx1y, center1Y);
+  dz2X = calcDeadzone(mn2x, mx2x, center2X);
+  Serial.print("center X="); Serial.print(center1X);
+  Serial.print(" Y=");       Serial.print(center1Y);
+  Serial.print(" R=");       Serial.print(center2X);
+  Serial.print("   deadzone X="); Serial.print(dz1X);
+  Serial.print(" Y=");            Serial.print(dz1Y);
+  Serial.print(" R=");            Serial.println(dz2X);
 }
 
 void loop() {
-  int rawX = analogRead(JOY_X);
-  int rawY = analogRead(JOY_Y);
+  int raw1X = analogRead(JOY1_X);
+  int raw1Y = analogRead(JOY1_Y);
+  int raw2X = analogRead(JOY2_X);
 
   JoystickPacket pkt;
-  // Center the raw 0..4095 readings around 0.
-  // If forward/back or turning feels inverted, negate the axis here.
-  pkt.x = rawX - centerX;
-  pkt.y = rawY - centerY;
+  // Center the raw 0..4095 readings around 0, then apply the calibrated
+  // per-axis deadzone. If an axis feels inverted, negate it here.
+  pkt.x = applyDeadzone(raw1X - center1X, dz1X);   // strafe
+  pkt.y = applyDeadzone(raw1Y - center1Y, dz1Y);   // forward/back
+  pkt.r = applyDeadzone(raw2X - center2X, dz2X);   // rotation
 
-  Serial.print("rawX=");  Serial.print(rawX);
-  Serial.print(" rawY="); Serial.print(rawY);
-  Serial.print("  ->  x="); Serial.print(pkt.x);
-  Serial.print(" y=");      Serial.print(pkt.y);
+  Serial.print("x=");  Serial.print(pkt.x);
+  Serial.print(" y="); Serial.print(pkt.y);
+  Serial.print(" r="); Serial.print(pkt.r);
 
   esp_now_send(broadcastAddr, (uint8_t *)&pkt, sizeof(pkt));
 
-  delay(200);  // slow down for readable serial output while debugging
+  delay(20);  // ~50 Hz update rate
 }

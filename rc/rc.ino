@@ -21,7 +21,7 @@ int center2X = 2048, center2Y = 2048;
 // Per-axis deadzone, computed from observed jitter (not hardcoded).
 int dz1X = 8, dz1Y = 8, dz2X = 8;
 
-const float DZ_FACTOR = 3.0;  // deadzone = observed jitter * this
+const float DZ_FACTOR = 1.2;  // deadzone = observed jitter * this
 const int   DZ_MIN    = 6;    // floor: some zone even if a pot reads rock-steady
 const int   DZ_MAX    = 300;  // cap: guards against a stick moved during calibration
 

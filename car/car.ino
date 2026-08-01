@@ -38,6 +38,7 @@ const int M4_PWM = 17;  // Driver2 PWMB -> BR
 const int PWM_FREQ = 20000;  // 20 kHz, above audible range
 const int PWM_RES  = 8;      // 8-bit duty (0..255)
 const int MAX_DUTY = 255;
+const int MIN_DUTY = 60;     // motor won't turn below ~this; nonzero commands lift to it
 
 // ---- Wireless packet (must match RC side) ----------------------------------
 typedef struct {
@@ -95,6 +96,17 @@ float normAxis(int v) {
 // Flatter near center than squared -> finer control at low input.
 float expo(float f) {
   return f * f * f;
+}
+
+// Map a normalized wheel value (-1..1) to signed duty. Lifts any nonzero command
+// up to the mechanical floor (MIN_DUTY) so the wheel actually turns, then scales
+// the remaining range up to MAX_DUTY. Zero stays zero (stop).
+int shapeDuty(float v) {
+  if (v > -0.0001f && v < 0.0001f) return 0;
+  float mag = fabsf(v);
+  if (mag > 1.0f) mag = 1.0f;
+  int duty = MIN_DUTY + (int)(mag * (MAX_DUTY - MIN_DUTY) + 0.5f);
+  return v < 0 ? -duty : duty;
 }
 
 // ---- ESP-NOW receive callback ----------------------------------------------
@@ -165,10 +177,10 @@ void loop() {
   m = max(m, fabsf(bl));
   m = max(m, fabsf(br));
 
-  int dFL = (int)(fl / m * MAX_DUTY);
-  int dFR = (int)(fr / m * MAX_DUTY);
-  int dBL = (int)(bl / m * MAX_DUTY);
-  int dBR = (int)(br / m * MAX_DUTY);
+  int dFL = shapeDuty(fl / m);
+  int dFR = shapeDuty(fr / m);
+  int dBL = shapeDuty(bl / m);
+  int dBR = shapeDuty(br / m);
 
   setMotor(M1_IN1, M1_IN2, M1_PWM, dFL);  // FL
   setMotor(M2_IN1, M2_IN2, M2_PWM, dFR);  // FR

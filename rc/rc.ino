@@ -13,6 +13,16 @@ const int JOY1_Y = 39;  // VN  - forward/back
 const int JOY2_X = 34;  //     - rotation
 const int JOY2_Y = 35;  //     - spare / reserved
 
+// ---- Button ----------------------------------------------------------------
+// One button to GPIO13 <-> GND, using the internal pull-up: idle reads HIGH,
+// pressed reads LOW (active-low). If yours is a module with its own pull-up,
+// wire its S pin here and VCC to 3V3 (never 5V). RC-local for now: just logged.
+const int BTN_PIN = 13;
+const unsigned long BTN_DEBOUNCE_MS = 25;
+bool btnStable = HIGH;          // last debounced level
+bool btnLastRead = HIGH;        // last raw read
+unsigned long btnLastChange = 0;
+
 // Stick centers AND deadzones are measured at boot from the resting sticks.
 // Keep both sticks centered and still during power-up / reset.
 int center1X = 2048, center1Y = 2048;
@@ -27,9 +37,10 @@ const int   DZ_MAX    = 300;  // cap: guards against a stick moved during calibr
 
 // ---- Wireless packet (must match car side) ---------------------------------
 typedef struct {
-  int16_t x;  // strafe   (left stick X, centered)
-  int16_t y;  // forward  (left stick Y, centered)
-  int16_t r;  // rotation (right stick X, centered)
+  int16_t x;    // strafe   (left stick X, centered)
+  int16_t y;    // forward  (left stick Y, centered)
+  int16_t r;    // rotation (right stick X, centered)
+  uint8_t btn;  // 1 = button pressed, 0 = released (active-low read inverted)
 } JoystickPacket;
 
 // Broadcast to any ESP-NOW peer listening on this channel.
@@ -62,6 +73,8 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("RC starting...");
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
   Serial.print("MAC: ");
@@ -110,6 +123,18 @@ void setup() {
 }
 
 void loop() {
+  // Debounce the button: only accept a level that's held past the window.
+  bool raw = digitalRead(BTN_PIN);
+  if (raw != btnLastRead) {
+    btnLastRead = raw;
+    btnLastChange = millis();
+  }
+  if (raw != btnStable && (millis() - btnLastChange) >= BTN_DEBOUNCE_MS) {
+    btnStable = raw;
+    Serial.println(btnStable == LOW ? "  BTN pressed" : "  BTN released");
+  }
+  bool btnPressed = (btnStable == LOW);  // active-low
+
   int raw1X = analogRead(JOY1_X);
   int raw1Y = analogRead(JOY1_Y);
   int raw2X = analogRead(JOY2_X);
@@ -120,10 +145,12 @@ void loop() {
   pkt.x = applyDeadzone(raw1X - center1X, dz1X);   // strafe
   pkt.y = applyDeadzone(raw1Y - center1Y, dz1Y);   // forward/back
   pkt.r = applyDeadzone(raw2X - center2X, dz2X);   // rotation
+  pkt.btn = btnPressed ? 1 : 0;
 
   Serial.print("x=");  Serial.print(pkt.x);
   Serial.print(" y="); Serial.print(pkt.y);
   Serial.print(" r="); Serial.print(pkt.r);
+  Serial.print(" btn="); Serial.print(btnPressed ? 1 : 0);
 
   esp_now_send(broadcastAddr, (uint8_t *)&pkt, sizeof(pkt));
 

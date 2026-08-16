@@ -34,6 +34,12 @@ const int M2_PWM = 5;   // Driver1 PWMB -> FR
 const int M3_PWM = 16;  // Driver2 PWMA -> BL
 const int M4_PWM = 17;  // Driver2 PWMB -> BR
 
+// ---- Solenoid --------------------------------------------------------------
+const int SOLENOID_PIN = 23;               // digital out (ADC2 pins are fine as outputs)
+const unsigned long SOL_OFF_MS = 1000;     // off duration
+const unsigned long SOL_ON_MS  = 100;      // on pulse
+const bool SOL_ACTIVE_HIGH = true;         // set false if the driver is active-low
+
 // ---- PWM config ------------------------------------------------------------
 const int PWM_FREQ = 20000;  // 20 kHz, above audible range
 const int PWM_RES  = 8;      // 8-bit duty (0..255)
@@ -42,14 +48,16 @@ const int MIN_DUTY = 60;     // motor won't turn below ~this; nonzero commands l
 
 // ---- Wireless packet (must match RC side) ----------------------------------
 typedef struct {
-  int16_t x;  // strafe
-  int16_t y;  // forward
-  int16_t r;  // rotation
+  int16_t x;    // strafe
+  int16_t y;    // forward
+  int16_t r;    // rotation
+  uint8_t btn;  // 1 = button pressed, 0 = released
 } JoystickPacket;
 
 volatile int16_t rxX = 0;
 volatile int16_t rxY = 0;
 volatile int16_t rxR = 0;
+volatile uint8_t rxBtn = 0;
 volatile unsigned long lastRxMs = 0;
 
 // Deadzone is handled (calibrated) on the RC side; inputs arrive already zeroed
@@ -81,6 +89,36 @@ void stopAll() {
   ledcWrite(M2_PWM, 0);
   ledcWrite(M3_PWM, 0);
   ledcWrite(M4_PWM, 0);
+}
+
+// Non-blocking solenoid loop: SOL_OFF_MS off, then SOL_ON_MS on, repeating.
+// DISABLED for now (not called from loop) — kept for when we want the sequence
+// back. The button-triggered one-off click below is used instead.
+void solenoidUpdate() {
+  static unsigned long last = 0;
+  static bool on = false;
+  unsigned long interval = on ? SOL_ON_MS : SOL_OFF_MS;
+  if (millis() - last >= interval) {
+    last = millis();
+    on = !on;
+    digitalWrite(SOLENOID_PIN, (on == SOL_ACTIVE_HIGH) ? HIGH : LOW);
+  }
+}
+
+// One-off solenoid click: fires a single SOL_ON_MS pulse, non-blocking.
+// solenoidClick() starts the pulse; solenoidOneShotUpdate() ends it on time.
+unsigned long solClickOffAt = 0;  // millis() deadline to turn off; 0 = idle
+
+void solenoidClick() {
+  digitalWrite(SOLENOID_PIN, SOL_ACTIVE_HIGH ? HIGH : LOW);
+  solClickOffAt = millis() + SOL_ON_MS;
+}
+
+void solenoidOneShotUpdate() {
+  if (solClickOffAt != 0 && millis() >= solClickOffAt) {
+    digitalWrite(SOLENOID_PIN, SOL_ACTIVE_HIGH ? LOW : HIGH);
+    solClickOffAt = 0;
+  }
 }
 
 // ---- Input shaping ---------------------------------------------------------
@@ -117,10 +155,15 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   rxX = pkt.x;
   rxY = pkt.y;
   rxR = pkt.r;
+  rxBtn = pkt.btn;
   lastRxMs = millis();
 }
 
 void setup() {
+  // Solenoid off first thing (safe at boot).
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, SOL_ACTIVE_HIGH ? LOW : HIGH);
+
   // Direction pins
   pinMode(M1_IN1, OUTPUT);  pinMode(M1_IN2, OUTPUT);
   pinMode(M2_IN1, OUTPUT);  pinMode(M2_IN2, OUTPUT);
@@ -152,12 +195,23 @@ void setup() {
 }
 
 void loop() {
+  // Repeating solenoid sequence is DISABLED for now (function kept, not called).
+  //   solenoidUpdate();
+  // Instead: finish any in-progress one-off click (non-blocking).
+  solenoidOneShotUpdate();
+
   // Failsafe: stop if we've lost the transmitter.
   if (millis() - lastRxMs > FAILSAFE_MS) {
     stopAll();
     delay(10);
     return;
   }
+
+  // One-off solenoid click on the button's press edge (link is alive here).
+  static uint8_t prevBtn = 0;
+  uint8_t btn = rxBtn;
+  if (btn && !prevBtn) solenoidClick();
+  prevBtn = btn;
 
   // Normalize + expo each axis.
   float x = expo(normAxis(rxX));  // strafe
@@ -194,6 +248,7 @@ void loop() {
     Serial.print("in x="); Serial.print(rxX);
     Serial.print(" y=");   Serial.print(rxY);
     Serial.print(" r=");   Serial.print(rxR);
+    Serial.print(" btn="); Serial.print(rxBtn);
     Serial.print("  duty FL="); Serial.print(dFL);
     Serial.print(" FR=");       Serial.print(dFR);
     Serial.print(" BL=");       Serial.print(dBL);

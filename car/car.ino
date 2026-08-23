@@ -147,6 +147,94 @@ int shapeDuty(float v) {
   return v < 0 ? -duty : duty;
 }
 
+// ---- Serial command interface ----------------------------------------------
+// Type into the Serial Monitor (newline-terminated):
+//   x,y        e.g. "1,1" or "0.5,-0.5"  -> drive at normalized x,y (r=0)
+//   x,y,r      e.g. "0,0,1"              -> include rotation
+//   ...,Ns     e.g. "1,1,2s" or "0,0,1,3s" -> run the command for N sec, then stop
+//   rc                                    -> hand control back to the RC link
+//   stop / s                              -> serial mode, all axes 0 (halt)
+// Values are normalized -1..1, LINEAR (no expo), clamped. Without a duration the
+// command persists until you change it or type "rc"; the RC failsafe is
+// suppressed in serial mode, so use "stop" or "rc" to halt.
+enum DriveMode { MODE_RC, MODE_SERIAL };
+DriveMode driveMode = MODE_RC;
+float cmdX = 0, cmdY = 0, cmdR = 0;      // normalized -1..1, used in serial mode
+unsigned long cmdExpireAt = 0;           // millis() deadline; 0 = hold indefinitely
+
+char serBuf[32];
+uint8_t serLen = 0;
+
+float clampUnit(float v) {
+  if (v > 1.0f) return 1.0f;
+  if (v < -1.0f) return -1.0f;
+  return v;
+}
+
+void handleSerialLine(char *line) {
+  while (*line == ' ' || *line == '\t') line++;  // skip leading space
+  if (line[0] == '\0') return;
+
+  if (strcasecmp(line, "rc") == 0) {
+    driveMode = MODE_RC;
+    Serial.println("-> RC mode");
+    return;
+  }
+  if (strcasecmp(line, "stop") == 0 || strcasecmp(line, "s") == 0) {
+    driveMode = MODE_SERIAL;
+    cmdX = cmdY = cmdR = 0;
+    cmdExpireAt = 0;
+    Serial.println("-> SERIAL stop (0,0,0)");
+    return;
+  }
+
+  // Parse "x,y" or "x,y,r", plus an optional duration token containing 's'
+  // (e.g. "2s", "1.5s") = run this command for N seconds then stop.
+  float vals[3] = {0, 0, 0};
+  int n = 0;
+  float durSec = 0;
+  bool haveDur = false;
+  char *tok = strtok(line, ", ");
+  while (tok) {
+    if (strchr(tok, 's') || strchr(tok, 'S')) {
+      durSec = atof(tok);   // atof stops at the 's'
+      haveDur = true;
+    } else if (n < 3) {
+      vals[n++] = atof(tok);
+    }
+    tok = strtok(NULL, ", ");
+  }
+  if (n >= 2) {
+    cmdX = clampUnit(vals[0]);
+    cmdY = clampUnit(vals[1]);
+    cmdR = (n >= 3) ? clampUnit(vals[2]) : 0.0f;
+    driveMode = MODE_SERIAL;
+    cmdExpireAt = (haveDur && durSec > 0) ? millis() + (unsigned long)(durSec * 1000.0f) : 0;
+    Serial.print("-> SERIAL x="); Serial.print(cmdX);
+    Serial.print(" y="); Serial.print(cmdY);
+    Serial.print(" r="); Serial.print(cmdR);
+    if (cmdExpireAt) { Serial.print(" for "); Serial.print(durSec); Serial.print("s"); }
+    Serial.println();
+  } else {
+    Serial.println("? use: x,y[,r] [Ns]  |  rc  |  stop");
+  }
+}
+
+void pollSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serLen > 0) {
+        serBuf[serLen] = '\0';
+        handleSerialLine(serBuf);
+        serLen = 0;
+      }
+    } else if (serLen < sizeof(serBuf) - 1) {
+      serBuf[serLen++] = c;
+    }
+  }
+}
+
 // ---- ESP-NOW receive callback ----------------------------------------------
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len != sizeof(JoystickPacket)) return;
@@ -177,11 +265,10 @@ void setup() {
   ledcAttach(M4_PWM, PWM_FREQ, PWM_RES);
   stopAll();
 
-#if DEBUG
+  // Serial is always up so the command interface works even with DEBUG off.
   Serial.begin(115200);
   delay(200);
-  Serial.println("CAR starting...");
-#endif
+  Serial.println("CAR starting...  (serial cmds: x,y | x,y,r | rc | stop)");
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
@@ -200,23 +287,40 @@ void loop() {
   // Instead: finish any in-progress one-off click (non-blocking).
   solenoidOneShotUpdate();
 
-  // Failsafe: stop if we've lost the transmitter.
-  if (millis() - lastRxMs > FAILSAFE_MS) {
-    stopAll();
-    delay(10);
-    return;
+  // Read any pending serial command (may switch mode / set cmdX,Y,R).
+  pollSerial();
+
+  float x, y, r;  // normalized axis values fed into the mecanum mix
+
+  if (driveMode == MODE_SERIAL) {
+    // Timed command: stop when the duration elapses.
+    if (cmdExpireAt != 0 && millis() >= cmdExpireAt) {
+      cmdX = cmdY = cmdR = 0;
+      cmdExpireAt = 0;
+      Serial.println("-> SERIAL command expired, stop");
+    }
+    // Direct linear command; no expo, no failsafe (holds until changed/"rc").
+    x = cmdX;
+    y = cmdY;
+    r = cmdR;
+  } else {
+    // RC mode. Failsafe: stop if we've lost the transmitter.
+    if (millis() - lastRxMs > FAILSAFE_MS) {
+      stopAll();
+      delay(10);
+      return;
+    }
+    // Normalize + expo each axis.
+    x = expo(normAxis(rxX));  // strafe
+    y = expo(normAxis(rxY));  // forward
+    r = expo(normAxis(rxR));  // rotation
   }
 
-  // One-off solenoid click on the button's press edge (link is alive here).
+  // One-off solenoid click on the button's press edge (RC packets only).
   static uint8_t prevBtn = 0;
   uint8_t btn = rxBtn;
   if (btn && !prevBtn) solenoidClick();
   prevBtn = btn;
-
-  // Normalize + expo each axis.
-  float x = expo(normAxis(rxX));  // strafe
-  float y = expo(normAxis(rxY));  // forward
-  float r = expo(normAxis(rxR));  // rotation
 
   // Mecanum mix. Flip a wheel's signs here if it runs the wrong way.
   float fl = y + x + r;
@@ -245,6 +349,7 @@ void loop() {
   static unsigned long lastDbg = 0;
   if (millis() - lastDbg >= DEBUG_INTERVAL_MS) {
     lastDbg = millis();
+    Serial.print(driveMode == MODE_SERIAL ? "[SER] " : "[RC]  ");
     Serial.print("in x="); Serial.print(rxX);
     Serial.print(" y=");   Serial.print(rxY);
     Serial.print(" r=");   Serial.print(rxR);
